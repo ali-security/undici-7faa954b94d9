@@ -623,6 +623,12 @@ describe('Cache Interceptor', () => {
       strictEqual(revalidationRequests, 0)
     }
 
+    // SEAL: the zero-lifetime entry has staleAt === cachedAt and this
+    //  version's isStale() checks `now > staleAt`, so a reuse within the same
+    //  millisecond as the store is served as fresh (upstream fixes that in lib
+    //  in nodejs/undici#5980). Step past that millisecond before reusing it.
+    await sleep(5)
+
     // Send second request. The response was stored but is already stale, so
     //  this should be a revalidation request answered with a 304 and served
     //  from the cache

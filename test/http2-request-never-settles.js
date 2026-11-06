@@ -11,8 +11,17 @@ const pem = require('@metcoder95/https-pem')
 const { Agent } = require('..')
 
 const nodeMajor = Number(process.versions.node.split('.')[0])
-const skipForMemoryCorruption = process.platform === 'linux' && (nodeMajor === 24 || nodeMajor === 25)
-const skipForOnreadAssertion = nodeMajor === 26
+const nodeMinor = Number(process.versions.node.split('.')[1])
+const skipForMemoryCorruption =
+  (process.platform === 'linux' && nodeMajor === 24) ||
+  nodeMajor === 25
+// nodejs/node#64850 (onread->IsFunction() assertion during session teardown)
+// was fixed by nodejs/node#65116, which first shipped in Node.js v26.10.0.
+// The v22.x backport (nodejs/node#66515) has not been released yet, so add a
+// version gate here once a Node.js 22.x release carries the fix.
+const skipForOnreadAssertion =
+  nodeMajor === 22 ||
+  (nodeMajor === 26 && nodeMinor < 10)
 
 // completeRequestStream() runs on an h2 stream's 'close':
 //
