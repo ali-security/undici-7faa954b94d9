@@ -6,7 +6,7 @@ const { once } = require('node:events')
 const { createGzip, createDeflate, createBrotliCompress, createZstdCompress, deflateSync, gzipSync } = require('node:zlib')
 const { tspl } = require('@matteo.collina/tspl')
 
-const { Client, errors, getGlobalDispatcher, setGlobalDispatcher, request, interceptors } = require('../..')
+const { Client, DecoratorHandler, errors, getGlobalDispatcher, setGlobalDispatcher, request, interceptors } = require('../..')
 const createDecompressInterceptor = require('../../lib/interceptor/decompress')
 
 test('should decompress gzip response', async t => {
@@ -1451,6 +1451,248 @@ test('should work with global dispatcher for both fetch() and request()', async 
   t.equal(requestResponse.headers['content-length'], undefined, 'request content-length header should be removed with global interceptor')
   t.equal(fetchResponse.headers.get('content-length'), undefined, 'content-length header should be removed with fetch due to global interceptor')
   t.equal(fetchResponse.headers.get('content-encoding'), undefined, 'content-encoding header should be removed with fetch due to global interceptor')
+
+  await t.completed
+})
+
+test('should converge downstream handler throw to a per-request error (GHSA-55wc-3pg8-jfw6)', async t => {
+  t = tspl(t, { plan: 2 })
+
+  // A downstream interceptor (dump) throws RequestAbortedError by design when
+  // the response exceeds maxSize. Previously the decompress interceptor
+  // forwarded decompressed chunks from zlib event callbacks without try/catch,
+  // so that by-design throw escaped the engine's error-convergence contract as
+  // an uncaughtException, crashing the whole process.
+  const server = createServer({ joinDuplicateHeaders: true }, (_req, res) => {
+    const body = gzipSync(Buffer.alloc(2 * 1024 * 1024, 0x41))
+    res.writeHead(200, {
+      'Content-Type': 'application/octet-stream',
+      'Content-Encoding': 'gzip'
+    })
+    res.end(body)
+  })
+
+  server.listen(0)
+  await once(server, 'listening')
+
+  const client = new Client(
+    `http://localhost:${server.address().port}`
+  ).compose(
+    createDecompressInterceptor(),
+    interceptors.dump({ maxSize: 1024 })
+  )
+
+  after(async () => {
+    await client.close()
+    server.close()
+    await once(server, 'close')
+  })
+
+  const response = await client.request({
+    method: 'GET',
+    path: '/'
+  })
+
+  // The over-limit response must not crash the process: the by-design dump
+  // throw is converged into a per-request AbortError instead.
+  const err = await response.body.text().then(
+    () => null,
+    (e) => e
+  )
+
+  t.ok(err, 'body should reject with an error')
+  t.equal(err.name, 'AbortError')
+
+  await t.completed
+})
+
+test('should converge a downstream onResponseEnd throw to a per-request error (GHSA-55wc-3pg8-jfw6)', async t => {
+  t = tspl(t, { plan: 2 })
+
+  // A downstream handler can also throw from onResponseEnd, not only from
+  // onResponseData. The decompress interceptor forwards the end event from a
+  // zlib event callback, so without try/catch that throw would likewise escape
+  // as an uncaughtException. It must converge into a per-request error instead.
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Encoding': 'gzip' })
+    res.end(gzipSync(Buffer.from('small valid body')))
+  })
+
+  server.listen(0)
+  await once(server, 'listening')
+
+  // Downstream handler that throws from onResponseEnd.
+  class ThrowOnResponseEnd extends DecoratorHandler {
+    onResponseEnd () {
+      throw new Error('downstream onResponseEnd failure')
+    }
+  }
+
+  const client = new Client(
+    `http://localhost:${server.address().port}`
+  ).compose(
+    createDecompressInterceptor(),
+    (dispatch) => (opts, handler) => dispatch(opts, new ThrowOnResponseEnd(handler))
+  )
+
+  after(async () => {
+    await client.close()
+    server.close()
+    await once(server, 'close')
+  })
+
+  const response = await client.request({ method: 'GET', path: '/' })
+
+  const err = await response.body.text().then(
+    () => null,
+    (e) => e
+  )
+
+  t.ok(err, 'body should reject with an error')
+  t.equal(err.message, 'downstream onResponseEnd failure')
+
+  await t.completed
+})
+
+test('should converge a downstream onResponseData throw before the response ends (GHSA-55wc-3pg8-jfw6)', async t => {
+  t = tspl(t, { plan: 2 })
+
+  // The compressed response is still in flight when the downstream handler
+  // throws, so the error must be converged through controller.abort() rather
+  // than escaping the zlib 'readable' callback as an uncaughtException.
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Encoding': 'gzip' })
+    const gzip = createGzip()
+    gzip.pipe(res)
+    gzip.write('first chunk of a response that never ends')
+    gzip.flush()
+    res.on('close', () => gzip.destroy())
+  })
+
+  server.listen(0)
+  await once(server, 'listening')
+
+  class ThrowOnResponseData extends DecoratorHandler {
+    onResponseData () {
+      throw new Error('downstream onResponseData failure')
+    }
+  }
+
+  const client = new Client(
+    `http://localhost:${server.address().port}`
+  ).compose(
+    createDecompressInterceptor(),
+    (dispatch) => (opts, handler) => dispatch(opts, new ThrowOnResponseData(handler))
+  )
+
+  after(async () => {
+    await client.close()
+    server.closeAllConnections()
+    server.close()
+    await once(server, 'close')
+  })
+
+  const response = await client.request({ method: 'GET', path: '/' })
+
+  const err = await response.body.text().then(
+    () => null,
+    (e) => e
+  )
+
+  t.ok(err, 'body should reject with an error')
+  t.equal(err.message, 'downstream onResponseData failure')
+
+  await t.completed
+})
+
+test('should converge downstream handler throw in a decompression chain to a per-request error (GHSA-55wc-3pg8-jfw6)', async t => {
+  t = tspl(t, { plan: 2 })
+
+  // Chained content-encodings forward data from the last decompressor of the
+  // pipeline; a by-design dump throw there must not crash the process either.
+  const server = createServer({ joinDuplicateHeaders: true }, (_req, res) => {
+    const body = deflateSync(gzipSync(Buffer.alloc(2 * 1024 * 1024, 0x41)))
+    res.writeHead(200, {
+      'Content-Type': 'application/octet-stream',
+      'Content-Encoding': 'gzip, deflate'
+    })
+    res.end(body)
+  })
+
+  server.listen(0)
+  await once(server, 'listening')
+
+  const client = new Client(
+    `http://localhost:${server.address().port}`
+  ).compose(
+    createDecompressInterceptor(),
+    interceptors.dump({ maxSize: 1024 })
+  )
+
+  after(async () => {
+    await client.close()
+    server.close()
+    await once(server, 'close')
+  })
+
+  const response = await client.request({
+    method: 'GET',
+    path: '/'
+  })
+
+  const err = await response.body.text().then(
+    () => null,
+    (e) => e
+  )
+
+  t.ok(err, 'body should reject with an error')
+  t.equal(err.name, 'AbortError')
+
+  await t.completed
+})
+
+test('should converge a downstream onResponseEnd throw in a decompression chain to a per-request error (GHSA-55wc-3pg8-jfw6)', async t => {
+  t = tspl(t, { plan: 2 })
+
+  // Chained content-encodings signal the end of the response from the
+  // pipeline() callback; a downstream onResponseEnd throw there must converge
+  // into a per-request error instead of escaping as an uncaughtException.
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Encoding': 'gzip, deflate' })
+    res.end(deflateSync(gzipSync(Buffer.from('small valid body'))))
+  })
+
+  server.listen(0)
+  await once(server, 'listening')
+
+  class ThrowOnResponseEnd extends DecoratorHandler {
+    onResponseEnd () {
+      throw new Error('downstream onResponseEnd failure')
+    }
+  }
+
+  const client = new Client(
+    `http://localhost:${server.address().port}`
+  ).compose(
+    createDecompressInterceptor(),
+    (dispatch) => (opts, handler) => dispatch(opts, new ThrowOnResponseEnd(handler))
+  )
+
+  after(async () => {
+    await client.close()
+    server.close()
+    await once(server, 'close')
+  })
+
+  const response = await client.request({ method: 'GET', path: '/' })
+
+  const err = await response.body.text().then(
+    () => null,
+    (e) => e
+  )
+
+  t.ok(err, 'body should reject with an error')
+  t.equal(err.message, 'downstream onResponseEnd failure')
 
   await t.completed
 })
