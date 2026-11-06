@@ -3,11 +3,12 @@
 const { createServer } = require('node:http')
 const { describe, test, after } = require('node:test')
 const { once } = require('node:events')
-const { strictEqual, notStrictEqual } = require('node:assert')
+const { strictEqual, notStrictEqual, deepStrictEqual } = require('node:assert')
 const { setTimeout: sleep } = require('node:timers/promises')
 const diagnosticsChannel = require('node:diagnostics_channel')
 const { Client, interceptors } = require('../../index')
 const { makeDeduplicationKey } = require('../../lib/util/cache')
+const DeduplicationHandler = require('../../lib/handler/deduplication-handler')
 
 describe('Deduplicate Interceptor', () => {
   test('deduplicates concurrent requests for the same resource', async () => {
@@ -1374,6 +1375,65 @@ describe('Deduplicate Interceptor', () => {
     }, excludeHeaders)
 
     strictEqual(key1, key2)
+  })
+
+  test('a handler that joins before the primary request starts receives the primary request context', () => {
+    const events = []
+    const handler = new DeduplicationHandler({
+      onRequestStart (controller, context) {
+        events.push(['primary start', context])
+      },
+      onResponseStart (controller, statusCode) {
+        events.push(['primary response', statusCode])
+      }
+    }, () => {})
+
+    const early = handler.addWaitingHandler({
+      onRequestStart (controller, context) {
+        events.push(['early start', context])
+      },
+      onResponseStart (controller, statusCode) {
+        events.push(['early response', statusCode])
+      }
+    })
+    strictEqual(early, true)
+
+    // The primary request context (and its redirect history) is not known yet,
+    // so the waiting handler must not be started with a missing context.
+    deepStrictEqual(events, [])
+
+    const history = [new URL('http://attacker.example/payload')]
+    const context = { history }
+    handler.onRequestStart({}, context)
+
+    strictEqual(events.length, 2)
+    strictEqual(events[0][0], 'early start')
+    strictEqual(events[0][1], context)
+    strictEqual(events[0][1].history, history)
+    strictEqual(events[1][0], 'primary start')
+    strictEqual(events[1][1], context)
+
+    // A handler that joins after the primary request started receives the
+    // context immediately.
+    const late = handler.addWaitingHandler({
+      onRequestStart (controller, context) {
+        events.push(['late start', context])
+      },
+      onResponseStart (controller, statusCode) {
+        events.push(['late response', statusCode])
+      }
+    })
+    strictEqual(late, true)
+    strictEqual(events.length, 3)
+    strictEqual(events[2][0], 'late start')
+    strictEqual(events[2][1], context)
+
+    handler.onResponseStart({}, 200, {}, 'OK')
+    deepStrictEqual(events.slice(3), [
+      ['primary response', 200],
+      ['early response', 200],
+      ['late response', 200]
+    ])
   })
 
   test('aborting a deduplicated request settles it with an AbortError', async () => {
